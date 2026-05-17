@@ -1,0 +1,409 @@
+================================================================================
+  安川 Sigma-7 速度环：理论推导、参数整定与代码实现
+================================================================================
+
+
+一、被控对象建模
+--------------------------------------------------------------------------------
+
+速度环的被控对象是电机轴的转动力学方程：
+
+    J * dω/dt = Tq - Tf - TL
+
+其中：
+    J   = 总转动惯量 [kg·m²]（电机转子 + 负载）
+    ω   = 转子角速度 [rad/s]
+    Tq  = 电磁转矩（由电流环产生，视为瞬时响应）
+    Tf  = 摩擦转矩（粘性摩擦 B·ω）
+    TL  = 负载扰动转矩
+
+对电流环做理想化假设（带宽远高于速度环，相当于增益=1）：
+    Tq(s) ≈ Kt · Iq(s)   （Kt 为转矩常数）
+
+忽略摩擦和负载扰动，得到速度对象的传递函数：
+
+            ω(s)       1
+    G(s) = ------ = -------
+            Tq(s)     J·s
+
+这是一个纯积分环节（一阶系统），这正是为什么速度控制器需要有比例项
+来提供阻尼的原因。
+
+
+二、速度环控制器结构
+--------------------------------------------------------------------------------
+
+安川 Sigma-7 的速度环采用 PI 控制器（含 I-P 变种）：
+
+标准 PI 控制：
+    U(s) = Kv · [ 1 + 1/(Ti·s) ] · E(s)
+         = Kv · E(s) + (Kv/Ti) · E(s)/s
+         = Kv · E(s) + Kvi · E(s)/s
+
+I-P 控制（指令只进比例，反馈同时进比例和积分）：
+    U(s) = Kvi · R(s)/s - Kv · Y(s) - Kvi · Y(s)/s
+         = Kvi/s · [R(s) - Y(s)] - Kv · Y(s)
+
+    目的：消除速度指令突变时的超调（比例项不跟踪阶跃指令尖峰）
+
+完整速度环信号流：
+
+    NetSpdRef                速度误差     PI控制器       转矩指令
+   ──┬────────────────────── [+] ──→ Kv, Kvi ──→ TrqRef ──→ CurrentLoop
+     │       ↑                │
+     │    SpdFFC             [−]
+     │   (速度前馈)            │
+     │                  SpdObsFbki
+     │                (速度反馈，经低通滤波器)
+     │
+     └─ SpdFBC (扰动观测器补偿)
+
+
+三、参数推导
+--------------------------------------------------------------------------------
+
+3.1 归一化参数 Kvx（BprmCalc.c: 960~970行）
+
+    2π · ω_max · J
+    Kvx = ─────────────────
+              T_max
+
+代码：
+    // OvrSpd = 最大速度对应角速度 [rad/s]
+    // Jmot   = 总转动惯量 [kg·m²]
+    // MaxTrq = 最大转矩 [Nm]
+    fw = Bprm->OvrSpd * C2PAIE7 / C10POW7;   // 2π·ω_max
+    Bprm->Kvx = fw * Bprm->Jmot / Bprm->MaxTrq;
+
+物理意义：Kvx 是归一化的"1Hz速度带宽对应的增益系数"。
+当速度环带宽设为 loophz [Hz] 时，比例增益为：
+    Kv = Kvx · loophz · (1 + jrate/100) / 1000
+
+其中 jrate 是用户设置的负载/电机转动惯量比（PnB01）。
+
+
+3.2 比例增益 Kv（BaseControlPrmCalc.c: 103~109行）
+
+PI控制模式（标准）：
+
+    Kv = Kvx · (100 + jrate) · Loophz / 1000
+
+代码：
+    GselGains->Kv = MlibScalKskxkx( Bprm->Kvx, (100+jrate)*Loophz, 1000, NULL, 24 );
+
+I-P控制模式（PI_rate = (100-ipg_rwt)/100 < 1）：
+
+    Kv  = 1                              ← 比例项归一化为1
+    Kv2 = Kvx · (100 + jrate) · Loophz / 1000   ← 总增益放在 Kv2
+
+物理意义推导：
+    闭环速度环传递函数（忽略积分项，视为纯比例分析）：
+        ω_cl(s)         Kv/J
+        ─────── = ──────────────────
+        ω_ref(s)   s + Kv/J
+
+    速度环带宽（-3dB频率）：
+        ω_bw = Kv / J = Kvx · Loophz · (2π)
+
+    即：设 loophz=40Hz，则速度环带宽约 40Hz（Kvx 已包含 J 的归一化）。
+
+
+3.3 积分增益 Kvi（BaseControlPrmCalc.c: 104~109行）
+
+    Kvi = Kv · Ts / (10 · Ti)
+
+代码：
+    GselGains->Kvi = MlibScalKskxkx( GselGains->Kv, KPI_MBCYCLEUS, 10*Pitime, NULL, 24 );
+
+    KPI_MBCYCLEUS = ScanB 周期 [μs]（通常 250μs 或 500μs）
+    Pitime        = 积分时间常数 [×0.1ms]（参数 PnB02 速度积分时间常数）
+
+物理意义：
+    Ti = 积分时间常数 [s]
+    离散积分实现：
+        Iout[k] = Iout[k-1] + Kvi · SpdErr[k] · Ts
+        其中 Kvi_discrete = Kv / Ti（连续域），
+        离散化后：Kvi = Kv · Ts / Ti
+
+
+3.4 速度反馈滤波器 KVfbFil
+
+    对速度反馈信号施加一阶低通滤波器，截止频率 ω_f：
+
+        H(z) = (1 - α) / (z - α),   α = exp(-ω_f · Ts)
+
+    目的：抑制编码器量化噪声。提高 Loophz 时需同步提高滤波带宽，
+    否则相位裕度损失导致振荡。
+
+
+3.5 负载惯量比 jrate（PnB01）
+
+    jrate = (J_load / J_motor) × 100 [%]
+
+    出现在增益计算中：
+        有效 J_total = J_motor · (1 + jrate/100)
+        Kv = Kvx · (1 + jrate/100) · Loophz
+
+    自动整定（ATYPE调整）和 TuneLess（调整功能）会在线估计 jrate，
+    结果存储在 TuneLessPrm->jrate。
+
+
+四、速度反馈来源
+--------------------------------------------------------------------------------
+
+速度反馈不是直接使用编码器脉冲微分，而是来自 ScanA 级别的
+观测器计算输出（CtrlLoopOut->MotSpd_a），该值经过滑动平均后使用：
+
+代码（BaseControls.c: 510~511行）：
+    BaseControls->CtrlCmdMngr.SpdFbki    = CtrlLoopOut->MotSpd_a;
+    BaseControls->CtrlCmdMngr.SpdObsFbki = CtrlLoopOut->MotSpd_a;
+
+MotSpd_a 是在 ScanA 中通过编码器位置差分和低通观测器计算得到的电机速度，
+单位为归一化速度（满速 = 0x01000000 = 2^24）：
+
+    MotSpd = dPosition_ScanA / Ts_ScanA   [pulse/ScanA]
+    归一化：MotSpd_normalized = MotSpd · Kmotspd    （Kmotspd = 2^24/OvrSpd_pulse）
+
+速度反馈在送入 PI 之前，还经过低通滤波器：
+    SpdFbFilo = LPF( SpdObsFbki + SpdFBC, KVfbFil, SpdFbFilo_prev )
+
+
+五、代码实现详解
+--------------------------------------------------------------------------------
+
+5.1 速度控制主函数（BaseLoop.c: 387~622行）
+
+函数：BaseSpeedControl( BASE_LOOPCTRLS *BaseLoops, SpdFFC, SpdFBC, BaseEnable )
+
+执行流程：
+
+Step 1 — 速度指令选择
+    if BBRefClrReq:        SpdRefo = 0            // BaseBlock时清零
+    elif CtrlMode==SPD:    SpdRefo = SpdRefi       // 速度控制模式
+    elif CtrlMode==ZCLMP:  SpdRefx = ZeroPositionControl()  // 零箝位
+
+Step 2 — 调整功能相位超前补偿（TuneLess激活时）
+    d_SpdRefx = LpxSpdRefPhaseComp( SpdRefx, SpdRefPhFil, SpdRefPhFilGn )
+    // 形式：相位超前 = LPF(ref) + gain * HPF(ref)
+    // 目的：补偿速度反馈低通滤波器引入的相位滞后
+
+Step 3 — 模式切换判断（PI → P 切换）
+    ModeSwitch() 根据 PnB03 设置，在以下条件之一成立时切换为 P 控制：
+    - 转矩指令超过阈值
+    - 速度指令超过阈值
+    - 加速度超过阈值
+    - 位置偏差超过阈值
+
+Step 4 — 速度PI控制（P控制分支）
+    SpdFbFilo = LPF( SpdObsFbki + SpdFBC, KVfbFil )   // 反馈低通
+    SpdErrP   = SpdRefx - SpdFbFilo + SpdFFC           // 误差计算
+    PacOut    = SpdErrP * Kv                            // 比例输出
+
+    // 积分在P控制时以时间常数衰减（而非保持）
+    IacOut = LPF( 0, KVintegFil, IacOut_prev )
+
+Step 5 — 速度PI控制（PI控制分支，正常运行）
+    SpdFbFilo = LPF( SpdObsFbki + SpdFBC, KVfbFil )   // 反馈低通
+    // I-P: 比例项乘 PI_rate（<1），抑制指令跳变超调
+    SpdErrP   = SpdRefx * PI_rate - SpdFbFilo + SpdFFC
+    PacOut    = SpdErrP * Kv                            // 比例输出
+
+    SpdErrI   = SpdRefx - SpdFbFilo + SpdFFC           // 积分用误差（不乘PI_rate）
+    // 抗积分饱和：仅在非转矩限制状态，或速度误差与转矩反号时积分
+    if (TrqClamp==FALSE) || (neri_calc_on==TRUE):
+        IacOut = Integral( SpdErrI, Kvi, Ivar64 )      // 积分输出
+
+Step 6 — 输出合成
+    TrqRef0 = PacOut + IacOut                          // PI输出
+    TrqRef  = TrqRef0 * Kv2                            // I-P模式下Kv2≠1
+
+对应代码（精简）：
+    // P控制分支（BaseLoop.c: 544~572行）
+    SpdFbFilo = MlibLpfilter1( SpdObsFbki+SpdFBC, KVfbFil, SpdFbFilo );
+    SpdErrP   = SpdRefx - SpdFbFilo + SpdFFC;
+    PacOut    = MlibMulgain( SpdErrP, GselGains->Kv );
+    IacOut    = MlibLpfilter1( 0, KVintegFil, IacOut );  // 积分衰减
+
+    // PI控制分支（BaseLoop.c: 578~604行）
+    SpdFbFilo = MlibLpfilter1( SpdObsFbki+SpdFBC, KVfbFil, SpdFbFilo );
+    SpdErrP   = MlibMulgainNolim( SpdRefx, PI_rate ) - SpdFbFilo + SpdFFC;
+    PacOut    = MlibMulgain( SpdErrP, GselGains->Kv );
+    SpdErrI   = SpdRefx - SpdFbFilo + SpdFFC;
+    IacOut    = MlibIntegral( SpdErrI, GselGains->Kvi, Ivar64 );
+
+    // 输出（BaseLoop.c: 615~619行）
+    TrqRef0   = PacOut + IacOut;
+    TrqRef    = MlibMulgain29( TrqRef0, GselGains->Kv2 );
+
+
+5.2 离散积分实现（MlibIntegral）
+
+    MlibIntegral 采用 64bit 累加器防溢出，形式为：
+
+        Ivar64 += SpdErr * Kvi       // 64bit 累加
+        IacOut  = Ivar64 >> 1        // 取高32bit
+
+    等效连续域：
+        IacOut(s) = Kvi/s · SpdErr(s)
+
+
+5.3 低通滤波器实现（MlibLpfilter1）
+
+    一阶 IIR 低通，双线性变换离散化：
+
+        y[k] = (1 - α) · x[k] + α · y[k-1]
+
+    参数 Kf（code 中的 KVfbFil 等）为：
+        Kf = 2^24 · (1 - exp(-ω_c · Ts))
+    经过 MlibPcalKf1gain() 计算。
+
+
+六、前馈与补偿
+--------------------------------------------------------------------------------
+
+6.1 速度前馈 SpdFFC（Feed-Forward Compensation）
+
+来源：PcmdFilter.c 中计算指令微分
+    SpdFFC = d(PosRef)/dt · Kff / 100
+
+代码路径（BaseLoop.c: 436行）：
+    BaseLoops->SpdRefSum = MlibSatAdd32( SpdRefo, SpdFFCx );
+
+作用：减小跟踪误差，实现零稳态位置误差（对阶跃位置指令）。
+
+
+6.2 扰动观测器补偿 SpdFBC（Disturbance Observer）
+
+来源：DisturbObserver 模块（ExControls.c）
+    估计负载扰动转矩 T̂_L，折算为等效速度补偿量
+
+    SpdFBC = T̂_L / Kv    （粗略折算）
+
+作用：抑制低频扰动（摩擦、重力等），减小稳态速度误差。
+相关参数：PnB04（观测器增益）、PnB05（观测器反馈增益比）。
+
+
+6.3 转矩前馈 TrqFFC
+
+来源：PcmdFilter.c 计算二阶微分（加速度 × 惯量）
+    TrqFFC = J_total · d²(PosRef)/dt²
+
+作用：前馈补偿惯量加速所需转矩，大幅提高动态响应。
+
+
+七、参数整定方法
+--------------------------------------------------------------------------------
+
+7.1 用户参数映射
+
+    Sigma-7 参数  │ 代码变量     │ 含义
+    ──────────────┼─────────────┼─────────────────────────────────
+    PnB00         │ loophz       │ 速度环带宽 [Hz]（位置控制时=速度增益）
+    PnB01         │ jrate        │ 负载惯量比 [%]（负载J/电机J × 100）
+    PnB02         │ pitime       │ 速度积分时间常数 [×0.1ms]
+    PnB03         │ ModeSWSel    │ P/PI 切换选择
+    PnB04         │ ObsJGain     │ 扰动观测器增益
+    PnB08         │ loophz2      │ 第2增益速度环带宽
+    PnB09         │ pitime2      │ 第2增益速度积分时间常数
+    PnB0E         │ KVfbFil      │ 速度反馈滤波时间常数 [×0.01ms]
+
+
+7.2 整定思路（从理论到实践）
+
+Step 1: 估算负载惯量比（PnB01）
+    - 离线：从机械设计图纸计算 J_load = Σ(m·r² + I)，填入 PnB01
+    - 在线：使用 "惯量自学习" 功能（Fn009，摆动电机测转矩响应）
+    - 或：使用 TuneLess（调整功能）在线估计
+
+Step 2: 设置速度环带宽（PnB00）
+    - 理论上限：电流环带宽的 1/3 ~ 1/5（通常电流环带宽 ≈ 1kHz，
+                所以速度环最大约 200~300Hz）
+    - 实际限制：机械谐振频率（负载柔性）决定实际上限
+    - 经验法则：从 20Hz 开始，逐渐增大，直到出现振动为止，退后 20%
+
+Step 3: 设置积分时间常数（PnB02）
+    - 带宽-积分时间经验关系：
+          Ti = 1 / (2π · ω_bw / 4)   ≈ loophz × 4 [ms]
+    - 积分时间过小 → 过冲增大（积分过激进）
+    - 积分时间过大 → 低频扰动抑制差（积分太慢）
+    - 典型值：loophz=40Hz → PnB02 ≈ 40~80（对应 4~8ms）
+
+Step 4: 速度反馈低通截止频率
+    - 一般设为速度环带宽的 3~5倍
+    - 带宽提高时需同步提高，否则相位损失过大
+
+Step 5: 验证
+    - 阶跃响应：超调 < 10%，无振荡
+    - 扰动响应：加减载时速度跌落后恢复时间 < 1/loophz
+    - 稳态误差：速度控制模式下稳态误差 ≈ 0（积分项消除）
+
+
+7.3 自动整定（TuneLess / One-Parameter Tuning）
+
+安川提供 TuneLess（调整功能）自动设定增益：
+- 代码路径：TuneLessCtrl 结构，TuneLessPrm->kv2, Ti, jrate
+- 原理：在线辨识机械时间常数，通过扩张状态观测器估计 J 和 Tf
+- 用户只需设置一个"响应性"等级（PnB00参数），
+  固件自动计算 Kv、Kvi、陷波滤波器频率
+
+对应代码（BaseControlPrmCalc.c: 58~63行）：
+    // GselNo=5 表示 TuneLess 增益组
+    TunLessPrm = &(BaseCtrlData->TuneLessCtrl.TuneLessPrm);
+    Loophz = TunLessPrm->kv2;    // 在线辨识得到的等效带宽
+    Pitime = TunLessPrm->Ti;     // 在线辨识得到的积分时间
+    jrate  = TunLessPrm->jrate;  // 在线辨识得到的惯量比
+
+
+八、增益切换（GainChange）
+--------------------------------------------------------------------------------
+
+固件支持最多6组增益参数（GselGains[0~5]），可在运行中无扰动切换：
+
+    GselNo 0~3：用户定义的固定增益组（PnB00/PnB01/PnB02...）
+    GselNo 4  ：伺服ON时用的初始增益
+    GselNo 5  ：TuneLess自动整定增益
+
+切换触发条件（PnB03 ModeSwitch + GainChange模块）：
+    - COIN（定位完成）信号
+    - 外部信号 /G-SEL
+    - 位置偏差阈值
+    - 速度指令阈值
+
+代码路径：GainChange.c / GselDetGainChngTiming()
+
+
+九、完整信号流图
+--------------------------------------------------------------------------------
+
+                     PnB01(jrate)  PnB00(loophz)  PnB02(pitime)
+                          │              │               │
+                          ▼              ▼               ▼
+                     BprmCalc:       BaseControlPrmCalc:
+                     Kvx计算         Kv = Kvx*(1+jrate/100)*loophz/1000
+                                     Kvi = Kv*Ts/(10*pitime)
+
+上位机指令
+(Mechatrolink) ──→ NetSpdRef ──┐
+                               │
+PcmdFilter            SpdFFC──┤     ┌──────────────────────────────────┐
+(速度前馈) ──────────────────→┤     │        速度PI控制器               │
+                               ▼     │                                  │
+                              [+] ──→│  SpdErr = SpdRef*PI_rate         │
+                               ↑     │           - SpdFbFilo + SpdFFC   │
+                              [−]    │  PacOut = SpdErr * Kv            │
+                               │     │  IacOut = Integral(SpdErr, Kvi) │
+编码器脉冲                      │     │  TrqRef = (PacOut + IacOut)*Kv2 │
+ScanA计算速度 ──→ MotSpd_a ─→LPF→ SpdFbFilo │                          │
+                         (KVfbFil)  │  ← 反馈滤波：抑制量化噪声        │
+                                    └──────────────────────────────────┘
+扰动观测器                                          │
+DisturbObs ──→ SpdFBC ──→ 加到反馈 ↑               ▼ TrqRef
+                                               转矩滤波器（LPF+Notch）
+                                                    │
+                                                    ▼
+                                               电流环（ServoIP）
+                                                    │
+                                                    ▼
+                                               电机输出转矩 Tq
+
+================================================================================

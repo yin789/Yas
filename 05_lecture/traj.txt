@@ -1,0 +1,428 @@
+================================================================================
+  BaseControlMain.c 分析
+  Source: 03_Project_code/04_SGD7S_M3/00_src/01_Standard/BaseControls/BaseControlMain.c
+  定位：ScanB 任务的伺服基础控制主程序（速度/位置环，125μs 周期）
+================================================================================
+
+
+================================================================================
+文件概述
+================================================================================
+
+文件名：BaseControlMain.c
+日语文件注释：サーボベースコントロールメイン機能定義
+              （伺服基础控制主功能定义）
+创建：2010.02.23 Y.Oka  For INGRAM（前代产品代号）
+
+包含三个函数：
+  InitScanBData()    ScanB 数据初始化
+  BpiScanBMain()     ScanB 周期主循环（核心）
+  PdetServoOnMake()  线性电机磁极检测伺服ON判断
+
+
+================================================================================
+函数一：InitScanBData( AXIS_HANDLE *AxisRscB )
+================================================================================
+
+在伺服使能前调用，完成 ScanB 层所有控制变量的初始化。
+
+  初始化对象                      说明
+  ──────────────────────────────  ─────────────────────────────────────────────
+  BaseControls->MencV/FencV       绑定主编码器/全闭环编码器句柄指针
+  MotSts                          清零电机状态结构体（位置/速度/转矩）
+  ZeroClampCtrl.var               零速钳位控制变量清零
+  GainChange                      伺服增益切换初始化（GselInitServoGainChange）
+  EhVobsCtrl                      高速观测器变量初始化（条件编译 EHVOBS_USE）
+  PosManager                      位置管理器初始化（PosMngInitPositionManager）
+  BasePositionControl             基础位置控制初始化（InitBasePositionControl）
+  VFFcmdFil / TFFcmdFil           速度/转矩前馈滤波器初始化（FFCmdFilInitialize）
+  TblDrive                        表格运行初始化（TblDriveInitialize）
+  DobsCtrl                        干扰观测器初始化（条件编译 DISTURBOBS）
+  TuneLessCtrl                    免调谐控制初始化（TuneLessCtrlInitialize）
+  DetVib                          振动检测观测器初始化（条件编译 VIB_DETECT_USE）
+  ResVib                          A型谐振振动抑制初始化（条件编译 ATYPE_RES_VIB_USE）
+  BlshCmp                         反向间隙补偿初始化（条件编译 BACKLASHCOMP）
+  SettlingTime                    整定时间计算初始化（StlgInitSettlingTime）
+  TransduceCtrl                   控制参数翻译服务初始化（TranlateCtrlPrmInitialize）
+  TrqLimitData                    转矩限制初始化（正/负向均设为最大值 NORMAXVALUE）
+  NetCtrlMcmd                     网络控制模式码清零（CTRLMODE_NOCMD）
+  MainPowerChecker.conf           主电源检测 TestMode 标志全部清零
+
+
+================================================================================
+函数二：BpiScanBMain( AXIS_HANDLE *AxisRscB, LONG ax_no )
+================================================================================
+
+ScanB 周期主循环，每 125μs 调用一次，是整个伺服控制的核心执行路径。
+
+执行流程
+--------
+
+  ① TranlateCtrlGetReq()          控制参数翻译请求检查
+       若有参数更新请求（TR_REQ_SCANB），调用 TranlateCtrlPrm() 更新控制参数
+       ↓
+  ② BpiInputControlCMD()          控制指令输入处理
+       解析来自通信层的位置/速度/转矩指令，写入 CtrlCmdMngr
+       ↓
+  ③ PCL/NCL 信号合并（网络接口非模拟型）
+       BaseControls->TrqLimitData.var.PclSignal |= IoSignals->PclSignal
+       BaseControls->TrqLimitData.var.NclSignal |= IoSignals->NclSignal
+       ↓
+  ④ [分支：PhaseReady == FALSE]   ← 磁极检测分支（线性电机上电后必须先做）
+  │
+  │   BpiMpoleFindMakePosCmd()    生成磁极检测用位置指令
+  │   BpiChangeSpdDetMaFil()      切换速度检测移动均值滤波器（扩大窗口）
+  │   PdetServoOnMake()           处理磁极检测期间的伺服ON请求
+  │   MpoleFindSequence()         磁极检测状态机（主体）
+  │   MpoleFindSpeedControl()     磁极检测用速度环控制（微弱电流激励）
+  │   MpFind->var.Step==MPF_END   检测完成后：
+  │       BpiChangeSpdDetMaFil()  恢复速度检测滤波器
+  │       MencV->PhaseReady=TRUE  置位相位就绪标志
+  │
+  ④ [分支：PhaseReady == TRUE]    ← 正常伺服控制分支
+  │
+  │   DetVibSpeedObserver()       振动检测速度观测器
+  │                               （全闭环时用 FencSpd，半闭环用 MotSpd）
+  │   DetVibSetSpeedError()       AAT 调谐期间振动检测速度误差设置
+  │   DetVibTraceRuntimeService() 振动检测观测器追踪服务
+  │   ResVibATypeResVibCtrl()     A型谐振振动抑制（条件编译，从速度反馈中减去抑制量）
+  │
+  │   BpiYecServoControl()        ← 伺服控制主体（速度环 + 位置环）
+  │
+  │   PosMngResponseManager()     位置响应管理（<S14C>）
+  │
+  │   BasePositionControl()       全闭环位置环（条件编译 FULC_SB_SUPPORT）
+  │       （仅在 FencUse!=0 时执行双环位置控制）
+  │
+  ↓
+  ⑤ BpiTorqueLimitControl()       转矩限制运算
+       处理 PCL/NCL 信号、参数 Pn400-Pn407 的转矩限制
+       ↓
+  ⑥ StlgCalculateSettlingTime()   整定时间计算
+       基于 dPcmda（位置指令差分）和 CoinSignal（定位完成信号）
+       ↓
+  ⑦ StlgMakeMaxOverShoot()        最大超调量计算 → 监视器 Un106
+       ↓
+  ⑧ StlgMakeCoinOffTime()         定位完成信号 OFF 时间计算 → 监视器 Un10B
+       ↓
+  ⑨ 监视器变量输出：
+       UnMonitor->AmonSpdRef = SpdRefo + SpdFFCx   （速度指令监视）
+       UnMonitor->AmonTrqRef = TrqRefMon            （转矩指令监视）
+       BaseControls->AmondPosCmd = dPcmda           （位置指令差分监视）
+
+关键结构体 AXIS_HANDLE
+-----------------------
+所有资源通过 AXIS_HANDLE 传递，是整个伺服控制的"资源总线"：
+
+  成员                  类型                  说明
+  ──────────────────    ──────────────────    ──────────────────────────────
+  MencV                 MENCV*                主编码器接口
+  FencV                 MENCV*                全闭环编码器接口
+  BaseControls          BASE_CTRL_HNDL*       基础控制句柄（增益/位置/转矩等）
+  BaseLoops             BASE_LOOPCTRLS*       速度环/位置环控制器
+  SvControlIf           SERVO_CONTROL_IF*     与微运算ASIP的接口
+  CtrlLoopOut           CTRL_LOOP_OUT*        控制环输出（TrqRefo 等）
+  SeqCtrlOut            SEQ_CTRL_OUT*         序列控制输出（SvRdy/MotStop 等）
+  MpFind                MPFIND*               磁极检测句柄
+  DetVib                DETVIB*               振动检测句柄
+  AlmManager            ALM_HNDL*             报警管理器
+  PowerManager          POWER_MGR_HNDL*       电源管理器
+  IoSignals             SEQ_IO_HNDL*          硬件 IO 信号
+  UnMonitor             ANLG_UN_MON_DATA*     Un 监视器数据
+  UniPrms               UNIT_PRMS*            参数（Bprm/Prm）
+
+
+================================================================================
+函数三：PdetServoOnMake( ..., AXIS_HANDLE *Axis )
+================================================================================
+
+处理线性电机磁极检测期间的伺服ON请求（仅在 NETIF_ANLGPLS_TYPE 以外的接口编译）。
+
+逻辑：
+  - 仅对线性电机（MOTTYPE_LINEAR）有效
+  - 读取 Pn587.0 参数决定是否需要磁极检测
+  - 若伺服ON时磁极未检测完成 → 返回报警码 ALM_PDET
+  - 处理 A.C22（磁极检测相位角异常）报警的清除逻辑
+  - 区分普通运行（FnSvControl=FALSE）和 ROUND 调谐运行（FnSvControl=TRUE）两种路径
+
+
+================================================================================
+设计要点总结
+================================================================================
+
+1. ScanB 任务分工
+     此文件负责速度/位置控制环（125μs）。
+     电流环在 ASIP（微运算处理器，62.5μs）中实现，不在此文件。
+     ScanC（2ms）负责参数更新、序列管理等低速任务。
+
+2. 磁极检测优先
+     PhaseReady 标志控制两个执行分支。
+     线性电机上电后必须先完成磁极检测，才能进入正常伺服控制。
+     检测期间施加微弱电流激励，通过观察速度响应识别磁极角度。
+
+3. 条件编译大量使用
+     CSW_SVCF_* 宏控制各功能模块的编译开关：
+       CSW_SVCF_DISTURBOBS          干扰观测器
+       CSW_SVCF_VIB_DETECT_USE      振动检测观测器
+       CSW_SVCF_ATYPE_RES_VIB_USE   A型谐振振动抑制
+       CSW_SVCF_EHVOBS_USE          高速观测器
+       CSW_SVCF_BACKLASHCOMP        反向间隙补偿
+       CSW_SVCF_FULC_MODE           全闭环模式
+
+4. 与轨迹规划层（MtCtrl/MtGenerator）的关系
+     BpiInputControlCMD() 从通信层读取指令（位置增量 dPosRefo 等），
+     这些指令来源于 MtCtrl/MtGenerator 产生的 DposOut，
+     经 SvControlIf 接口传递到 BaseControlMain，
+     最终由 BpiYecServoControl() 执行速度/位置环运算。
+
+================================================================================
+  Sigma-7 轨迹规划实现分析
+  Source: 03_Project_code/04_SGD7S_M3/00_src/01_Standard/Communications/M3/Motion/
+  Key files: MtCtrl.c, MtGenerator.c, Sposing.c, MtGenerator.h, MtCtrl.h
+================================================================================
+
+
+================================================================================
+整体架构
+================================================================================
+
+轨迹规划分三层，均在 ScanB（125μs）周期内执行：
+
+  MtCtrl.c          ← 运动状态机 + 模式分发（POSING/INTERPOLATE/VELCTRL...）
+      ↓ MG_INOUT (DposIn, Tspd, Mtype)
+  MtGenerator.c     ← 速度曲线生成（每 ScanB 输出一个 DposOut）
+      ↓ outData.DposOut
+  AccFilter.c       ← 位置指令滤波
+      ↓
+  BaseControlMain   → 速度/位置控制环
+
+
+================================================================================
+运动模式总表（mtcMakeCmd[] 函数表，MtCtrl.c）
+================================================================================
+
+  枚举                  模式          对应实现              说明
+  --------------------  ----------    ------------------    ----------------------------------------
+  MTYPE_POSING          P2P 定位      MtgPosing()           梯形速度曲线，驱动器自主规划
+  MTYPE_SPOSING         P2P S曲线     MtgSposing()          S形速度曲线，驱动器自主规划
+  MTYPE_INTERPOLATE     CSP 插补      MtgInterpolate()      上位机逐周期发位置，驱动器细分
+  MTYPE_FOLLOW          跟随          MtgFollowup()         伺服使能但无运动指令时的位置保持
+  MTYPE_FEED            连续进给      MtgPosing()           速度控制 + 位置限位
+  MTYPE_EX_POSING       扩展定位      MtgPosing() + Latch   带硬件Latch触发的定位
+  MTYPE_EX_FEED         扩展进给      MtgPosing() + Latch   带硬件Latch触发的进给
+  MTYPE_VELCTRL         速度控制      MtgVelctrl()          速度环
+  MTYPE_TRQCTRL         转矩控制      MtgVelctrl()          转矩环
+  MTYPE_HOMING          回零          MtgPosing() + 状态机  DEC信号 + Latch 两阶段回零
+  MTYPE_HOLD            减速停止      MtgHold()             减速到位停止
+  MTYPE_SHOLD           S曲线减速停   MtgShold()            S曲线减速停止
+
+
+================================================================================
+运动状态机（MtcControlState[]，MtCtrl.c）
+================================================================================
+
+  MSTAT_DISABLE
+      ↓ MtEenable=TRUE + SensOn
+  MSTAT_WAITPG_RDY     ← 等待编码器（SENS_ON_COMP）
+      ↓ SENS_ON_COMP=1
+  MSTAT_READY          ← 就绪，等待 ServoOn
+      ↓ SERVO_ON_COMP=1
+  MSTAT_RUN            ← 运行中，执行各种 Motion 指令
+      ↓ ServoOn=FALSE + RampStop 功能使能
+  MSTAT_RAMP_STOP      ← 减速停止（等待电机停止）
+      ↓
+  MSTAT_WAIT_SVOFF     ← 等待伺服 OFF 完成
+      ↓ SERVO_ON_COMP=0
+  MSTAT_READY
+
+
+================================================================================
+P2P：POSING 模式（梯形速度曲线）
+================================================================================
+
+入口：mtcMakePosingRef() [MtCtrl.c] → MtgPosing() [MtGenerator.c]
+
+关键参数（MG_PRM 结构体）：
+  accrate1    加速段1加速度常数（低速段）  [ref/cyc]
+  accrate2    加速段2加速度常数（高速段）  [ref/cyc]
+  decrate1    减速段1减速度常数（低速段）  [ref/cyc]
+  decrate2    减速段2减速度常数（高速段）  [ref/cyc]
+  altspd_a    加速段切换速度点             [ref/cyc]
+  altspd_d    减速段切换速度点             [ref/cyc]
+
+每 ScanB 周期（125μs）的计算流程：
+
+  ① DposIn = Tpos - Ipos
+       计算当前指令位置到目标位置的剩余距离
+
+  ② mtgCalcStpDistance()
+       预计算从当前速度到停止的制动距离 sd_dist：
+         - 两段梯形面积积分（两级减速：decrate2 高速段 + decrate1 低速段）
+         - 携带小数余量 sd_dist0 保证精度
+
+  ③ mtgCheckDecelaration()
+       buf = DposIn - sd_dist - (Cspd >> vel_shift)
+       buf < 0 → 制动距离已超过剩余距离，必须开始减速
+
+  ④ 速度决策：
+       Cspd < Tspd && buf >= 0  → 加速
+           低速段：Cspd += accrate1（Cspd < altspd_a）
+           高速段：Cspd += accrate2（Cspd >= altspd_a）
+       buf < 0                  → 减速：mtgDecreaseSpd()
+           高速段：Cspd -= decrate2（Cspd > altspd_d）
+           低速段：Cspd -= decrate1（Cspd <= altspd_d）
+       Cspd > Tspd              → 减速到目标速度（目标速度变小时）
+
+  ⑤ 位移输出：
+       DposOut = Cspd >> vel_shift      （整数部分）
+       dpos0 += Cspd << vel_shift_s     （小数余量累积，超出时进位）
+
+  ⑥ 到位判断：
+       DposOut == DposIn → 返回 TRUE，完成
+
+速度曲线形状（两段加减速梯形）：
+
+  速度
+   ↑
+   |       altspd_a         altspd_d
+   |          ↓                ↓
+   |    accrate2 段     decrate2 段
+   |   /‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾\
+   |  / accrate1                 \ decrate1
+   | /                            \
+   |/                              \____
+   +--------------------------------→ 位置/时间
+
+  注：altspd_a=0 时退化为单段加速；altspd_d=0 时退化为单段减速
+
+
+================================================================================
+P2P：SPOSING 模式（S形速度曲线）
+================================================================================
+
+入口：mtcMakeSposingRef() [MtCtrl.c] → MtgSposing() [Sposing.c]
+
+S曲线通过 Jerk（加加速度）实现平滑过渡，消除梯形曲线的加速度突变：
+
+关键参数（MG_SPOSING 结构体）：
+  dJerkAcc        加速段 Jerk               [ref/cyc³]
+  dJerkDec        减速段 Jerk               [ref/cyc³]
+  JerkAccRate     加速段加速度变化率         [ref/cyc²]
+  JerkDecRate     减速段加速度变化率         [ref/cyc²]
+  CurrentAccRate  当前加速度                 [ref/cyc²]
+  AltSpd_a1/a2    加速段速度切换点
+  AltSpd_d1/d2    减速段速度切换点
+  InitAcc/InitDec 初始加/减速度
+
+S曲线四个状态：
+  SPOSING_INI_MODE  →  SPOSING_ACC_MODE  →  SPOSING_DEC_MODE1  →  SPOSING_DEC_MODE2
+  （初始化）           （加速，Jerk 斜升）    （减速预备）          （减速，Jerk 斜降）
+
+速度曲线形状（S形）：
+
+  速度
+   ↑         Jerk斜升      Jerk斜降
+   |        /‾‾\      /‾‾‾‾‾‾\/‾‾\
+   |       /    \____/         \    \
+   |      /                         \
+   |     /                           \
+   |____/                             \____
+   +------------------------------------→ 时间
+
+S曲线比例：
+  S_RATIO_MIN = 0   → 纯梯形（无 Jerk 段）
+  S_RATIO_MAX = 50  → 完全S形（Jerk段占加减速时间的50%）
+
+指令变化处理（mtcMakeSposingRef）：
+  - 目标速度变化时：若非减速中，重启 SPOSING
+  - 目标位置变化时：若非减速中，重启 SPOSING；若已在减速且剩余距离仍在增加则重启
+
+
+================================================================================
+CSP：INTERPOLATE 模式（周期同步位置）
+================================================================================
+
+入口：mtcMakeInterpolRef() [MtCtrl.c] → MtgInterpolate() [MtGenerator.c]
+
+原理：驱动器不自主规划轨迹，上位机（PLC/控制器）每通信周期发送一个位置设定值，
+      驱动器只做通信周期到 ScanB 周期之间的线性细分插补。
+
+代码流程（MtCtrl.c - mtcMakeInterpolRef）：
+
+  if( hdl->cmdData.CmdRstReq )           // 每个通信周期到来新位置时
+  {
+      cmdOut->DposIn = PsnSetTPOS( &hdl->psnHdl, hdl->cmdData.TPos );
+                                          // 计算本通信周期的位置增量
+      cmdOut->Vref   = hdl->cmdData.Velocity;   // 前馈速度（来自上位机）
+      cmdOut->Tref   = hdl->cmdData.Trq;        // 前馈转矩（来自上位机）
+      hdl->segCnt    = hdl->mtPrm.BasePrm.seg_num;  // 复位细分计数
+  }
+  else if( hdl->segCnt == 0 )
+  {
+      return mtcMakeNopRef( hdl, cmdOut );   // 本周期内已输出完毕
+  }
+  hdl->segCnt--;
+
+代码流程（MtGenerator.c - MtgInterpolate）：
+
+  dpos = inOut->DposIn + hdl->dposRem;          // 加上上拍余量
+  inOut->DposOut = dpos / hdl->basePrm->seg_num; // 均分到每个 ScanB
+  hdl->dposRem   = dpos % hdl->basePrm->seg_num; // 余量留到下拍
+
+时序关系（以通信周期 250μs、ScanB 125μs 为例，seg_num=2）：
+
+  通信周期（250μs）  |←── 上位机发 TPos_n ──→|←── 上位机发 TPos_{n+1} ──→|
+  ScanB（125μs）     |──ScanB_1──|──ScanB_2──|──ScanB_3──|──ScanB_4──|
+  DposOut            | dPos_n/2  | dPos_n/2  |dPos_{n+1}/2|dPos_{n+1}/2|
+
+  seg_num = 通信周期 / ScanB周期 = 250μs / 125μs = 2
+
+前馈支持：
+  - VrefOut = Vref × refToOsKx  （速度前馈，由上位机提供，驱动器按比例换算）
+  - TrefOut = Tref >> 6          （转矩前馈，由上位机提供）
+
+
+================================================================================
+P2P vs CSP 核心对比
+================================================================================
+
+  维度              P2P（POSING/SPOSING）          CSP（INTERPOLATE）
+  ──────────────    ───────────────────────────    ──────────────────────────────
+  轨迹规划者        驱动器自主规划                  上位机（PLC/运动控制器）
+  上位机发什么      目标位置 + 目标速度（一次）      每通信周期一个位置设定值
+  驱动器做什么      生成完整梯形/S形速度曲线         仅在通信周期内做线性细分
+  前馈支持          仅位置前馈                       速度前馈 + 转矩前馈（由上位机给）
+  多轴同步          各轴独立，不保证同步              上位机同一时刻发对应位置，天然同步
+  加速度曲线        驱动器参数决定（accrate/decrate） 上位机决定（驱动器透传）
+  指令格式          POSING cmd: TPos + TSpeed        INTERPOLATE cmd: TPos（每周期）
+  适用场景          单轴定位、简单点位运动            多轴插补、复杂轨迹、CNC/机器人
+
+
+================================================================================
+关键数据结构（MtGenerator.h）
+================================================================================
+
+MG_INOUT（每 ScanB 周期的输入/输出）：
+  DposIn    输入：本周期需走的距离（相对）     [ref]
+  Tspd      输入：POSING 目标速度              [ref/s]
+  Vref      输入：速度前馈                     [2^30/MAX]
+  Tref      输入：转矩前馈                     [MAX_TRQ/2^30]
+  DposOut   输出：本 ScanB 实际输出位移        [ref]
+  VrefOut   输出：速度指令                     [2^24/OS]
+  TrefOut   输出：转矩指令                     [2^24/MAX]
+
+MG_HNDL（Motion Generator 句柄）：
+  Cspd      当前指令速度（内部累积）           [ref/cyc，小数点在 vel_shift 位]
+  dpos0     位移小数余量
+  dposRem   插补余量（INTERPOLATE 模式用）
+  MG_SPOSING sposing  S曲线状态和参数
+
+MT_HNDL（Motion Control 句柄，MtCtrl.h）：
+  MT_CMD  cmdData   来自上层的运动指令
+  MG_INOUT outData  发给 MtGenerator 的数据
+  MG_HNDL mtgHdl    Motion Generator 实例
+  PSN_HNDL psnHdl   位置管理（Ipos/Apos/Tpos/Lpos）
+  ACF_HNDL acfHdl   加速度滤波器
+  MT_PRM  mtPrm     运动参数（accrate/decrate/seg_num 等）
+
+================================================================================
