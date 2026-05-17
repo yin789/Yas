@@ -1,0 +1,408 @@
+================================================================================
+子项目区别说明（03_Project_code 内各固件项目对比）
+================================================================================
+
+这五个项目是同一套伺服固件代码库，针对不同上位机接口编译出的不同固件镜像，
+核心控制算法完全共享，区别只在通信层和产品定制层。
+
+一览对比表
+----------
+  项目            产品型号   上位机接口                  编译宏                    轴数   固件码
+  02_SGD7S_AP     SGD7S      模拟量电压 + 脉冲序列        NETIF_ANLGPLS_TYPE        1轴    —
+  03_SGD7S_M2     SGD7S      MECHATROLINK-II              NETIF_M2_TYPE             1轴    —
+  04_SGD7S_M3     SGD7S      MECHATROLINK-III             NETIF_M3_TYPE             1轴    0x02250000
+  05_SGD7S_CM     SGD7S      Custom Motion（DPM总线）     NETIF_CM_TYPE             1轴    —
+  06_SGD7W_M3     SGD7W      MECHATROLINK-III             NETIF_M3_TYPE+CSW_SGD7W   2轴    0x02250001
+
+共享的部分（完全相同）
+----------------------
+  00_Bsp/JL086_bsp/        ← BSP 层完全相同（同一颗 JL086A SoC）
+  01_Standard/
+    BaseControls/           ← 伺服控制算法完全共享（位置环/速度环/振动抑制/前馈...）
+    BaseSequences/          ← 运行序列完全共享（使能/报警/电源管理...）
+    Kernel/                 ← OS 内核完全共享
+
+  ScanB 基础周期全部相同：125μs
+
+不同的部分
+----------
+① 通信层（核心区别）
+
+  02_SGD7S_AP → Communications/AP/
+      ├── ScanN/          ← 模拟量/脉冲轮询接口（不走网络总线）
+      └── Motion/         ← 本地运动控制
+
+  03_SGD7S_M2 → Communications/M2/
+      ├── Mlink/          ← MECHATROLINK-II 链路层（17字节帧，2.5Mbps）
+      └── Motion/
+
+  04_SGD7S_M3 → Communications/M3/
+      ├── MLink/          ← MECHATROLINK-III 链路层（32/64字节帧，100Mbps以太网物理层）
+      └── Motion/
+
+  05_SGD7S_CM → Communications/DPM/
+      ├── Mlink/          ← 双口RAM总线（内嵌运动控制器，如上位PLC直连）
+      ├── Motion/
+      └── SC_UartDrv.c    ← 串口驱动（CM型有独立串口调试接口）
+
+  06_SGD7W_M3 → Communications/M3/
+      ├── MLink/          ← 同 M3，但需处理双轴数据打包
+      └── Motion/
+
+② 产品定制层
+
+  02_Custom/00_SGD7/
+    01_SGD7S_AP/    ← AP型特有：模拟量输入处理、脉冲指令解码
+    02_SGD7S_M2/    ← M2型特有：M2报警码映射、M2参数寄存器表
+    03_SGD7S_M3/    ← M3型特有：M3命令集、SystemSetting.h（CSW_NETIF_TYPE=NETIF_M3_TYPE）
+    04_SGD7S_CM/    ← CM型特有：DPM接口映射、CM命令集
+    05_SGD7W_M3/    ← W型特有：双轴资源管理（MAX_AXIS_NUMBER=2，SERVO_FIRM_CODE=0x02250001）
+
+③ SGD7W（06）与其他最本质的差别
+
+  SGD7W 是双轴驱动器，需要在同一颗 SoC 上同时运行两套伺服控制循环：
+
+    // 04_SGD7S_M3（单轴）
+    #define MAX_AXIS_NUMBER   1
+    #define CSW_BOARD_TYPE    SGD7S_TYPE
+
+    // 06_SGD7W_M3（双轴）
+    #define MAX_AXIS_NUMBER   2          // 两套 AXIS_HANDLE
+    #define CSW_BOARD_TYPE    SGD7W_TYPE
+    // 额外编译宏: CSW_SGD7W_TYPE        // 控制双轴相关的条件编译分支
+
+架构示意
+--------
+
+  ┌─────────────────────────────────────────────────────┐
+  │                   JL086A SoC                        │
+  │                                                     │
+  │  ┌─────────────────────────────────────────────┐    │
+  │  │  ASIP（微运算处理器）  电流环  62.5μs        │    │
+  │  └─────────────────────────────────────────────┘    │
+  │                                                     │
+  │  ┌──────────┐  ┌──────────┐  共享                  │
+  │  │BaseCtrl  │  │BaseSeq   │  ScanB 125μs            │
+  │  │(速度/位置)│  │(状态序列)│  ←── 5个项目完全相同   │
+  │  └──────────┘  └──────────┘                        │
+  │                                                     │
+  │  ┌──────┬──────┬──────┬──────┐  ← 通信层各自不同   │
+  │  │  AP  │  M2  │  M3  │ DPM  │                     │
+  │  │模拟  │ML-II │ML-III│CM总线│                     │
+  │  └──────┴──────┴──────┴──────┘                     │
+  └─────────────────────────────────────────────────────┘
+          ↑AP型    ↑M2型   ↑M3/W型  ↑CM型
+       脉冲/模拟  网络总线  网络总线  内嵌控制器
+
+  结论：一套控制算法，四种总线接口，编译时通过 CSW_NETIF_TYPE 宏切换；
+        SGD7W 额外增加双轴支持（CSW_SGD7W_TYPE + MAX_AXIS_NUMBER=2）。
+
+================================================================================
+  安川 Sigma-7 (Yaskawa7) 项目树
+  Project Tree for Yaskawa Sigma-7 Servo Drive Firmware
+================================================================================
+
+顶层结构
+--------
+Yaskawa7/
+├── 01_compile_environment/     ← ARM DS-5 IDE 开发环境安装包 (DS-5 v5.x, Windows)
+├── 02_design_doc/              ← 设计文档（日/中文）
+├── 03_Project_code/            ← 嵌入式固件源代码（Eclipse CDT 工作区）
+├── 04_hardware/                ← 硬件原理图
+└── user_manual/                ← 用户手册
+
+
+================================================================================
+01_compile_environment — 编译环境
+================================================================================
+
+01_compile_environment/
+├── setup.exe                   ← ARM DS-5 安装程序入口
+├── data/
+│   └── arm_*.cab               ← 安装包分卷（arm_1.cab ~ arm_25.cab）
+├── readme.html
+└── ds-5_license_management_guide.pdf
+
+说明：ARM DS-5 IDE（Eclipse-based ARM工具链），用于编译 ARM Cortex-R4F 目标程序。
+
+
+================================================================================
+02_design_doc — 设计文档
+================================================================================
+
+02_design_doc/
+├── 20130702版/                          ← 早期版本设计文档
+│   ├── 900-130-147_Mercury_SW_Architecture.pdf    ← Σ-7 Mercury 软件架构总览
+│   ├── RS0400323_通信ASIC_JL100外部规格书.pdf      ← JL100 通信ASIC规格
+│   ├── rb1400401_Mercury伺服SoC(JL-086)_伺服IP模块.pdf
+│   ├── rb1400402_Mercury伺服SoC(JL-086)_M-IIIP模块.pdf
+│   ├── RB1400590_微运算IP软件手册.doc               ← ASIP固件手册
+│   ├── RB1400591_Mercury_SoC(JL086A)说明书.doc
+│   ├── RB1400592_Mercury_SoC_伺服IP说明书.doc/pdf
+│   ├── RB1400593_Mercury_SoC_M3IP说明书.doc
+│   ├── SGD7S,W_変更管理.xls                        ← 版本变更管理
+│   ├── SGD7Sマイクロ-C変換対応表.xls               ← 微代码-C代码映射表
+│   ├── SGD7Wマイクロ-C変換対応表.xls
+│   └── MakeJL086Reg.xls                            ← JL086 寄存器生成表
+│
+├── JL-086A ARM Cortex-R4F SoC 芯片手册 rev2.0/     ← JL086A SoC 完整芯片手册
+│   ├── 第1章  概要
+│   ├── 第2章  端子机能（引脚定义）
+│   ├── 第3章  CPU（ARM Cortex-R4F）
+│   ├── 第4章  初期化接口
+│   ├── 第5章  时钟功能
+│   ├── 第6章  SCU（System Control Unit）
+│   ├── 第7章  内存映射
+│   ├── 第8章  中断控制器
+│   ├── 第9章  Serial Flash 存储控制器
+│   ├── 第10章 ROM/SRAM 控制器
+│   ├── 第11章 APB（时钟·复位控制）
+│   ├── 第12章 Timer with Capture（TAUJ2）
+│   ├── 第13章 CSI（Clock Serial Interface）
+│   ├── 第14章 Interval Timer
+│   ├── 第15章 I2C
+│   ├── 第16章 UART
+│   ├── 第17章 GPIO
+│   ├── 第18章 DMA 控制器
+│   ├── 第19章 ADC
+│   ├── 第20章 USB 2.0 Host Function
+│   ├── 第24章 PCI-Express（GEN1）
+│   ├── 第25章 CoreSight（调试追踪）
+│   ├── 第26章 寄存器一览
+│   ├── 第27章 边界扫描测试规格
+│   ├── 第28章 封装概观
+│   └── 第30章 UDL
+│
+└── SDG7 电流控制/                       ← 电流控制算法相关PDF
+    ├── Basedef.pdf          ← 基础定义
+    ├── Global.pdf           ← 全局变量
+    ├── MpConstTbl.pdf       ← 微处理器常数表
+    ├── MprgJL086.pdf        ← JL086 微程序
+    ├── MprgSgd7.pdf         ← SGD7 微程序
+    ├── MprgSgdv.pdf         ← SGDv 微程序（多版本）
+    ├── MprgStruct.pdf       ← 微程序结构
+    ├── RefTbl.pdf           ← 参考表
+    ├── RomTable.pdf         ← ROM 表
+    └── SvIpAccess.pdf       ← 伺服IP访问接口
+
+
+================================================================================
+03_Project_code — 固件源码（Eclipse CDT 工作区）
+================================================================================
+
+03_Project_code/                     ← Eclipse CDT 工作区根目录
+│
+├── 00_Products/                     ← 编译输出（构建产物）
+│   ├── Bin/
+│   │   ├── 01_Mercury_Platform      ← 平台引导 ELF
+│   │   ├── 02_SGD7S_AP.axf/.bin    ← SGD7S AP 核固件
+│   │   ├── 03_SGD7S_M2.axf/.bin    ← SGD7S MECHATROLINK-II 固件
+│   │   ├── 04_SGD7S_M3.axf/.bin    ← SGD7S MECHATROLINK-III 固件
+│   │   ├── 06_SGD7W_M3.axf/.bin    ← SGD7W 双轴 M3 固件
+│   │   ├── BOOT/    ← 各产品 .boot 引导镜像（含 _i.bin 初始化版）
+│   │   ├── FIRM/    ← 各产品 .firm 固件镜像
+│   │   ├── MIRROR/  ← 各产品 .mir 镜像备份
+│   │   └── RUNTIME/ ← 各产品 .rtm 运行时镜像
+│   └── Prm/                         ← 产品参数文件（.prm）
+│       ├── SGD7S/
+│       │   ├── Prm_x00A/  ← 不同型号参数（1R6A, 2R8A, 5R5A, 120A...）
+│       │   ├── Prm_x10A/
+│       │   ├── Prm_x20A/
+│       │   └── Prm_xE0A/
+│       └── SGD7W/
+│           └── Prm_x20A/
+│
+├── 01_Mercury_Platform/             ← [PROJECT] 平台层（公共引导）
+│   └── 00_src/
+│       ├── 00_Bsp/
+│       │   └── JL086_bsp/          ← JL086A SoC BSP
+│       │       ├── config.h          ← 芯片配置
+│       │       ├── INTEGRITY.h       ← INTEGRITY RTOS 适配
+│       │       ├── Interrupt.h / Interrupts.c / InterruptTbl.c
+│       │       ├── JL086Core.c       ← CPU 核心初始化
+│       │       ├── SFlash.c/.h       ← Serial Flash 驱动
+│       │       ├── SramMemc.c        ← SRAM 控制器
+│       │       ├── UsbFuncDriver.c   ← USB 功能驱动
+│       │       ├── usb_function/
+│       │       ├── CPUPeripheral/    ← CPU 外设（ARMPF.h, VIC）
+│       │       ├── elf.c/.h          ← ELF 加载器（引导其他核镜像）
+│       │       └── init_SGD7.s       ← 启动汇编（复位向量）
+│       ├── 01_Standard/
+│       │   └── Kernel/              ← OS 内核抽象层
+│       │       ├── Boot/
+│       │       ├── Driver/
+│       │       ├── Include/
+│       │       ├── Lib/
+│       │       └── Round/
+│       └── 02_Custom/
+│           └── 00_SGD7/
+│               └── 00_SpecCommon/   ← SGD7 平台定制
+│
+├── 02_SGD7S_AP/                     ← [PROJECT] SGD7S — 应用处理器核
+│   └── 00_src/
+│       ├── 00_Bsp/JL086_bsp/       ← (同 Platform BSP)
+│       ├── 01_Standard/
+│       │   ├── BaseControls/        ← 基础伺服控制算法
+│       │   ├── BaseSequences/       ← 伺服运行序列/状态机
+│       │   ├── Kernel/              ← OS 抽象（Boot/Driver/Lib/Round/ScanA~C）
+│       │   └── Communications/
+│       │       └── AP/              ← 应用层通信协议栈
+│       │           ├── APTaskIfMain.c   ← AP 任务主接口
+│       │           ├── Motion/          ← 运动控制命令处理
+│       │           ├── ScanN/           ← 轮询通信（Scan N）
+│       │           └── XlsTbl/          ← 参数表（Excel生成）
+│       └── 02_Custom/
+│           └── 00_SGD7/
+│               └── 01_SGD7S_AP/    ← SGD7S AP 产品定制
+│
+├── 03_SGD7S_M2/                     ← [PROJECT] SGD7S — MECHATROLINK-II 通信核
+│   └── 00_src/
+│       ├── 00_Bsp/JL086_bsp/
+│       ├── 01_Standard/
+│       │   ├── BaseControls/
+│       │   ├── BaseSequences/
+│       │   ├── Kernel/
+│       │   └── Communications/
+│       │       └── M2/              ← MECHATROLINK-II 协议栈
+│       └── 02_Custom/00_SGD7/
+│
+├── 04_SGD7S_M3/                     ← [PROJECT] SGD7S — MECHATROLINK-III 通信核
+│   └── 00_src/
+│       ├── 00_Bsp/JL086_bsp/
+│       ├── 01_Standard/
+│       │   ├── BaseControls/        ← 控制算法（约40个模块）
+│       │   │   ├── BaseControlMain.c     ← 控制主循环
+│       │   │   ├── BaseLoop.c            ← 基础控制环
+│       │   │   ├── ModelControl.c        ← 模型控制（前馈）
+│       │   │   ├── GainChange.c          ← 增益切换
+│       │   │   ├── ResVibCtrl.c          ← 谐振振动抑制
+│       │   │   ├── AutoGainChange.c      ← 自动增益调整
+│       │   │   ├── BacklashComp.c        ← 反向间隙补偿
+│       │   │   ├── RippleComp.c          ← 转矩波动补偿
+│       │   │   ├── FieldWeakening.c      ← 弱磁控制
+│       │   │   ├── PosManager.c          ← 位置管理
+│       │   │   ├── PcmdFilter.c          ← 位置指令滤波
+│       │   │   ├── TableDrive.c          ← 表格驱动
+│       │   │   ├── JatOffLine.c          ← 离线惯量辨识
+│       │   │   ├── MotorPoleFind.c       ← 磁极检测
+│       │   │   ├── ProgramJog.c          ← 程序寸动
+│       │   │   └── CtrlPrmTransducer.c   ← 控制参数转换
+│       │   ├── BaseSequences/       ← 运行状态序列
+│       │   │   ├── SequenceMain.c        ← 序列主控
+│       │   │   ├── BaseEnableSequence.c  ← 使能序列
+│       │   │   ├── CheckAlarm.c          ← 报警检测
+│       │   │   ├── CheckMotSts.c         ← 电机状态检测
+│       │   │   ├── PowerManager.c        ← 电源管理
+│       │   │   ├── PowerMonitor.c        ← 电源监控
+│       │   │   ├── OverheatManager.c     ← 过热管理
+│       │   │   ├── LifeTimePrediction.c  ← 寿命预测
+│       │   │   ├── RemVibFreq.c          ← 振动频率检测
+│       │   │   ├── AlmLatch.c            ← 报警锁存
+│       │   │   └── SequenceIo.c          ← IO 序列
+│       │   ├── Kernel/              ← OS 内核（Boot/Driver/Include/Lib/Round/ScanA/B/C）
+│       │   └── Communications/
+│       │       └── M3/              ← MECHATROLINK-III 协议栈
+│       │           ├── ComCfg.h
+│       │           ├── M3CfgTbl.c       ← M3 配置表
+│       │           ├── M3TaskIfMain.c   ← M3 任务接口主控
+│       │           ├── MLink/           ← MECHATROLINK 链路层
+│       │           │   ├── CmdAnalyzer.c    ← 命令解析
+│       │           │   ├── ComManager.c     ← 通信管理
+│       │           │   ├── ComAlmMngr.c     ← 通信报警管理
+│       │           │   ├── M3StdCmdProc.c   ← 标准命令处理
+│       │           │   ├── M3StdRspProc.c   ← 标准响应处理
+│       │           │   ├── RspManager.c
+│       │           │   └── CmdTable.c
+│       │           └── Motion/          ← 运动控制层
+│       │               ├── MtCtrl.c         ← 运动控制主体
+│       │               ├── MtApi.c          ← 运动API
+│       │               ├── MtGenerator.c    ← 轨迹生成
+│       │               ├── MtPRM.c          ← 运动参数
+│       │               ├── Position.c       ← 位置控制
+│       │               ├── AccFilter.c      ← 加速度滤波
+│       │               ├── PRMBank.c        ← 参数组管理
+│       │               └── Sposing.c        ← 定位控制
+│       └── 02_Custom/
+│           └── 00_SGD7/
+│               └── 00_SpecCommon/   ← SGD7 M3 产品定制
+│                   ├── AnalogMonitor/    ← 模拟量监视
+│                   ├── DataTrace/        ← 数据追踪
+│                   ├── Registers/        ← 寄存器映射
+│                   └── TrigIo/           ← 触发IO
+│
+├── 05_SGD7S_CM/                     ← [PROJECT] SGD7S — Custom Motion 核
+│   └── 00_src/
+│       ├── 00_Bsp/JL086_bsp/
+│       ├── 01_Standard/
+│       │   ├── BaseControls/
+│       │   ├── BaseSequences/
+│       │   ├── Kernel/
+│       │   └── Communications/
+│       └── 02_Custom/00_SGD7/
+│
+├── 06_SGD7W_M3/                     ← [PROJECT] SGD7W — 双轴 MECHATROLINK-III
+│   └── 00_src/
+│       ├── 00_Bsp/JL086_bsp/       ← (与 SGD7S 相同 BSP)
+│       ├── 01_Standard/             ← (与 SGD7S_M3 相同标准层)
+│       └── 02_Custom/
+│           └── 00_SGD7/            ← SGD7W 双轴定制
+│
+├── debugger/                        ← 调试器配置文件
+│
+└── Mercury_Projects_org/            ← 原始参考项目存档（只读参考）
+    ├── 00_src/                      ← 共用源码（与各子项目共享）
+    │   ├── 00_Bsp/
+    │   ├── 01_Standard/
+    │   └── 02_Custom/
+    ├── 10_Projects/                 ← 对应的 Eclipse 项目文件（标准配置）
+    │   └── 00_Standard/
+    │       ├── 00_Products/
+    │       ├── 01_Mercury_Platform/
+    │       ├── 02_SGD7S_AP/
+    │       ├── 03_SGD7S_M2/
+    │       ├── 04_SGD7S_M3/
+    │       ├── 05_SGD7S_CM/
+    │       └── 06_SGD7W_M3/
+    ├── 99_VC_Projects/              ← Windows PC 仿真项目（Visual C++）
+    │   ├── MercurySimulation.sln
+    │   └── MercurySimulation/       ← PC 端仿真（Stubs.c, ServoIf.c, FG.c...）
+    └── SGD7S,W_変更管理.xls         ← 版本变更管理
+
+
+================================================================================
+04_hardware — 硬件资料
+================================================================================
+
+04_hardware/
+├── 900-127-103_0_sgd7s_ifa00aa_a0_sch.pdf   ← SGD7S IFA00AA 控制板原理图
+├── 900-127-103_0_sch_sgd7s_ifa00aa_a0.pdf   ← （同上，另版本）
+└── CB1R6_CIRC_DR.pdf                         ← 1R6A 机型电路图
+
+
+================================================================================
+user_manual — 用户手册
+================================================================================
+
+user_manual/
+├── Σ-7系列_SGD7S_模拟量电压·脉冲序列指令型.pdf    ← 脉冲/模拟接口型手册
+├── Σ-7系列_SGD7S_MECHATROLINK-II通信指令型.pdf    ← M-II 通信型手册
+├── Σ-7系列_SGD7S_MECHATROLINK-III通信指令型.pdf   ← M-III 通信型手册
+├── Sigma-7S EtherCAT (CoE) Communication Reference.pdf ← EtherCAT 通信参考
+└── Σ-7综合产品样本中国版.pdf                       ← 产品样本（中文）
+
+
+================================================================================
+架构要点总结
+================================================================================
+
+  层次              内容
+  ──────────────    ────────────────────────────────────────────────────────────
+  硬件平台          安川自研 JL-086A SoC（ARM Cortex-R4F，实时处理器）
+  编译工具链        ARM DS-5 IDE（Eclipse CDT + ARM GCC/armcc）
+  多核分工          AP核（应用层） + M2/M3核（通信协议） + 微运算ASIP（电流控制）
+  产品型号          SGD7S（单轴）× 4种接口 + SGD7W（双轴）× M3
+  固件分层          BSP → Kernel → Standard（Controls + Sequences + Communications）→ Custom
+  固件输出格式      .boot（引导） / .firm（固件） / .mir（镜像备份） / .rtm（运行时）
+  PC仿真            Visual C++ 仿真项目（MercurySimulation.sln）
+
+================================================================================

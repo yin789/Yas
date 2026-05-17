@@ -1,0 +1,269 @@
+================================================================================
+  安川 Sigma-7 (Mercury 平台) 固件架构与时序分析
+================================================================================
+
+
+一、整体架构概览
+--------------------------------------------------------------------------------
+
+                         MercuryMain()
+  InitCorePeripheral() -> InitializeAxisGlobals() -> SysInitMain()
+                          └─> SysRoundTask() [进入主循环]
+
+       硬件中断                     硬件中断              硬件中断
+          │                           │                     │
+   ┌──────▼──────┐           ┌────────▼───────┐    ┌───────▼──────┐
+   │   ScanA INT │           │   ScanB INT    │    │  ScanC INT   │
+   │  ~125 μs    │  N:1触发  │  ~250/500 μs   │M:1 │   ~2 ms      │
+   │ 最高优先级   │◄─────────►│  中等优先级     │◄──►│  序列级       │
+   └─────────────┘           └────────────────┘    └──────────────┘
+                                                             │
+                                                    ┌────────▼──────┐
+                                                    │  Round Task   │
+                                                    │  背景任务循环  │
+                                                    │  ~2ms+ 周期   │
+                                                    └───────────────┘
+
+
+二、四个执行上下文详解
+--------------------------------------------------------------------------------
+
+【ScanA】中断，~125 μs — 电流环协调层
+文件：IntScanA.c / SysScanAInt()
+
+SysScanAInt()
+  ├─ MicroIfInputCycData()        ← 从 JL-086 ServoIP 读取当前环状态（ADC电流值）
+  ├─ KpxInputScanA()              ← 读取编码器/脉冲硬件输入
+  ├─ OpiIntSync()                 ← Mechatrolink 网络同步
+  ├─ SysInputScanAProcessData()   ← 处理编码器反馈，更新速度/位置估算
+  ├─ ApxYecServoControl()         ← ★ScanA核心：执行速度/转矩前馈计算，发指令给ServoIP
+  ├─ KpxOutputScanA()             ← 打包输出数据（PWM参考量）
+  └─ MicroIfOutputCycData()       ← 写入 ServoIP（触发实际 PWM 更新）
+
+注：ScanA 本身不做电流 PI 控制，那在 JL-086 ServoIP 硬件模块中完成（~31μs 级别）。
+ScanA 负责读回结果、计算速度反馈、给 ServoIP 发送新参考值（Id/Iq reference）。
+每 N 个 ScanA 触发一次 ScanB 中断。
+
+
+【ScanB】中断，~250/500 μs — 速度环 + 位置环
+文件：IntScanB.c / SysScanBInt() + BaseControlMain.c / BpiScanBMain()
+
+SysScanBInt()
+  ├─ SencSetIntCycleP1Mode()          ← 切换编码器中断周期模式
+  ├─ SysBaseServoReadHWInputs()       ← 读硬件输入
+  │    ├─ HALdrv_InputSerialIO()      ← 串行 I/O（FBA/COA 信号）
+  │    ├─ KpxAdcScanBService()        ← ADC 采样（DC 母线电压等）
+  │    ├─ KpxPlsScanBService()        ← 脉冲计数器更新
+  │    └─ SHalDrv_ReadLatchPosition() ← 锁存位置读取
+  │
+  ├─ SysBasePowerControl()            ← 变流器控制（OV检测、回生控制、250μs周期）
+  │
+  ├─ SysBaseServoInputProcess()       ← 编码器位置输入处理
+  │    ├─ BpiInputMotorPosition()     ← 读编码器计数，计算电机位置
+  │    └─ BpiOutputNetStatus()        ← 向网络层输出监控状态
+  │
+  ├─ OpiInputProcess()                ← 通信输入（Mechatrolink 指令解析）
+  ├─ DtrcExecute()                    ← 数据跟踪（oscilloscope功能）
+  ├─ OpiRunTimeScanProcess()          ← 网络运行时处理
+  │
+  ├─ SysBaseServoOutputProcess()      ← ★ScanB核心
+  │    └─ BpiScanBMain()             ← 速度环 + 位置环主计算
+  │         ├─ TranlateCtrlPrm()     ← 控制参数实时转换
+  │         ├─ BpiInputControlCMD()  ← 输入控制模式指令（位置/速度/转矩）
+  │         ├─ PosMngPositionManager()← 位置管理（指令脉冲累积、误差计算）
+  │         ├─ BpxYecServoControl()  ← 位置→速度→转矩级联控制计算
+  │         └─ 增益切换/前馈/抑振滤波
+  │
+  ├─ OpiOutputProcess()               ← 通信输出（状态反馈给上位机）
+  ├─ BpxOutputAnalogMonitor()         ← 模拟监视器输出（250μs 半周期）
+  ├─ HALdrv_OutputSerialIO()          ← 串行 I/O 输出
+  ├─ SHalDrv_KickWDT()               ← 喂狗
+  └─ [满足条件时触发 ScanC 中断]
+
+
+【ScanC】中断，~2 ms — 序列控制 + 报警管理
+文件：IntScanC.c / SysScanCInt()
+
+SysScanCInt()
+  ├─ 处理时间监控（检查是否超时，触发 A.BF0 系统报警）
+  ├─ HALdrv_ReadInputSignals()        ← 读序列 I/O 输入信号（SI0~SI6等）
+  ├─ PcmInputPowerStatus()            ← 主电源状态采集
+  ├─ KpxAdcScanCService()             ← ADC 服务（温度等低速量）
+  ├─ KpxPlsScanCService()             ← 脉冲接口服务
+  ├─ SeqIoInputSeqSignalsCom()        ← 序列信号解析（P-CL, N-CL, DEC, EXT等）
+  │
+  ├─ 电源管理
+  │    ├─ PcmPowerManager()           ← 主电源管理状态机
+  │    ├─ PcmCountRegeneOnTime()      ← 回生晶体管导通时间统计
+  │    └─ PcmCheckRegeneOverLoad()    ← 回生过载检测（→ A.320 / A.920）
+  │
+  ├─ 报警检测
+  │    ├─ OhmCheckOverHeatAlm()       ← 过热检测（→ A.7A0）
+  │    ├─ PcmCheckFanLock()           ← 风扇故障检测（→ A.7AB）
+  │    ├─ AdetCheckOCAlarmDetections()← OC（过电流）检测（→ A.300系）
+  │    └─ AdetCheckMotorOverCurrent() ← 电机过电流检测
+  │
+  ├─ LifeTimeSurvivorCalculateMain()  ← 寿命预测计算（电容/继电器）
+  │
+  ├─ 各轴循环处理
+  │    ├─ SyscAlarmDetections()       ← 各轴报警检测汇总
+  │    ├─ SyscBaseDriveSequence()     ← 基础驱动序列（Servo ON/OFF、DB控制）
+  │    ├─ SyscSequenceMain()          ← ★序列主状态机（使能、正转、反转、停止等）
+  │    └─ SyscSencAbsoOperation()     ← 绝对值编码器操作（多圈数据）
+  │
+  ├─ SyscSequenceCommon()             ← 单元级公共序列处理
+  ├─ KpxSifMsgManager()              ← 串行接口消息管理
+  └─ KlibCountTimeStamp()            ← 时间戳更新（100ms单位）
+
+
+【Round】背景任务，~2 ms+ — 低优先级服务
+文件：Round.c / SysRoundTask() + RpiRoundMain()
+
+SysRoundTask()                          ← 无限循环
+  ├─ 等待 ScanC 计数器变化（同步到 ScanC）
+  │
+  └─ RpiRoundMain()                     ← 每次 ScanC 后执行一次
+       ├─ OpiRoundProcedure()           ← 网络 Round 处理（Mechatrolink 参数交换）
+       ├─ UsbFuncTaskControl()          ← USB 功能任务
+       ├─ [各轴循环]
+       │    ├─ FunRunTimeService()      ← Fn功能执行（自整定/Jog/FFT/参数调整）
+       │    ├─ AutoNotchFilterSetting() ← 自动陷波滤波器设置序列
+       │    ├─ PdetWriteMotorPhaseSequence() ← 磁极检测结果写回
+       │    └─ LifeTimeDBPrmStoreValueToEeprom() ← 寿命参数写EEPROM
+       │
+       ├─ ALMHistoryWriteService()      ← 报警历史写入 EEPROM
+       ├─ DetTempManager()              ← 温度IC管理
+       └─ LpxSoftReset()               ← 软复位处理
+  │
+  ├─ KpxMsgManager()                   ← 消息管理器
+  ├─ KpxDownloadEeprom()               ← EEPROM 下载服务
+  └─ KlibWaitus(500)                   ← 延时 0.5 ms
+
+
+三、控制环路层次（从内到外）
+--------------------------------------------------------------------------------
+
+┌──────────────────────────────────────────────────────────┐
+│  JL-086 ServoIP 硬件模块  ~31 μs（自主运行，无需CPU干预） │
+│    ADC采样 (Iu, Iv)                                      │
+│    Clarke变换：Iu,Iv → Iα,Iβ                            │
+│    Park变换：Iα,Iβ,θ → Id_actual, Iq_actual             │
+│    d/q 轴电流 PI 控制（KdP, KdI, KqP, KqI）             │
+│    解耦前馈：Vd -= Lq·ω·Iq,  Vq += Ld·ω·Id + Φ·ω       │
+│    逆Park变换：Vd,Vq,θ → Vα,Vβ                          │
+│    SVPWM → Vu/Vv/Vw → IGBT 驱动                        │
+├──────────────────────────────────────────────────────────┤
+│  ScanA（CPU Cortex-R4）  ~125 μs                         │
+│    速度反馈计算（编码器脉冲微分）                         │
+│    转矩/速度前馈计算                                      │
+│    向 ServoIP 写入新的 Id/Iq 参考值                      │
+│    速度纹波补偿（RippleComp）                            │
+├──────────────────────────────────────────────────────────┤
+│  ScanB（CPU）  ~250 μs / 500 μs                         │
+│    位置管理（PosMngPositionManager）                     │
+│    位置误差 → 速度指令（位置 P 控制）                    │
+│    速度指令滤波（ModelControl、陷波、低通）               │
+│    转矩限制（TrqLimitControl）                           │
+│    增益切换（GainChange）                                │
+│    扰动观测器（DisturbObserver）                         │
+│    共振抑制（ResVibCtrl）                                │
+├──────────────────────────────────────────────────────────┤
+│  ScanC（CPU）  ~2 ms                                     │
+│    使能/禁止序列状态机                                   │
+│    报警检测与保护                                        │
+│    电源管理（回生、OV）                                  │
+├──────────────────────────────────────────────────────────┤
+│  Round（CPU）  背景                                      │
+│    自整定、参数管理、面板操作、EEPROM                    │
+└──────────────────────────────────────────────────────────┘
+
+
+四、关键数据结构
+--------------------------------------------------------------------------------
+
+所有任务共享 AXIS_HANDLE *AxisRsc[N] 数组，每个轴的句柄包含：
+
+  字段               内容
+  ─────────────────────────────────────────────────────
+  BaseControls      速度/位置控制变量（PI积分器、误差等）
+  BaseLoops         ScanA 级控制输出（PosCtrl、RippleCmp等）
+  MencV             电机编码器变量（位置、速度、磁极角）
+  FencV             全闭环编码器变量
+  SvControlIf       网络控制接口（NetSpdRef、NetTrqRef、CmdCtrl）
+  CtrlLoopOut       电流环输出（IqRef、IdRef、TrqRef）
+  SeqCtrlOut        序列控制输出（BeComplete、MotStop、SvonSts）
+  IoSignals         I/O 信号状态（SI/SO 物理信号）
+  PowerManager      电源管理（DC母线电压、回生、过压）
+  AlmManager        报警管理（报警代码、历史）
+  TaskProcessTime   各 Scan 任务处理时间监控
+
+
+五、启动时序
+--------------------------------------------------------------------------------
+
+上电复位
+  └─ MercuryMain()
+       ├─ InitCorePeripheral()          ← JL-086 外设初始化（GIC、DMA、UART等）
+       ├─ InitializeAxisGlobals()       ← AXIS_HANDLE 全局数据结构分配与指针初始化
+       └─ SysInitMain()                ← 完整系统初始化
+            ├─ 读 EEPROM 参数
+            ├─ 电机/编码器型号识别
+            ├─ 各子系统初始化（BaseControl、Sequence、Network、FnManager...）
+            ├─ 计算控制参数（Bprm 基础参数、增益、带宽）
+            ├─ InitInterruptStart()    ← 使能 ScanA/ScanB/ScanC 中断
+            └─ 返回 → SysRoundTask()  ← 进入背景无限循环
+
+
+六、电流环硬件实现（JL-086 ServoIP）
+--------------------------------------------------------------------------------
+
+JL-086 是安川自研的专用 ASIC，内部集成了 Cortex-R4 CPU 和 ServoIP 硬件模块。
+ServoIP 是片内专用硬件逻辑（非外部 FPGA），通过内存映射寄存器（0xC0007000起）
+与 CPU 通信。
+
+CPU 与 ServoIP 的分工：
+
+  CPU (Cortex-R4)  写 → 0xC000705C  IdIn  （d轴电流参考）
+                   写 → 0xC000705E  IqIn  （q轴电流参考）
+                   写 → 0xC0007060  PhaseHIn（转子电气角θ）
+
+  ServoIP 硬件自主执行（无需CPU介入，~31μs一个完整循环）：
+      1. Clarke 变换：Iu,Iv → Iα,Iβ
+      2. Park 变换：Iα,Iβ,θ → Id_actual, Iq_actual
+      3. d轴 PI：(IdIn - Id_actual) → Vd_PI
+      4. q轴 PI：(IqIn - Iq_actual) → Vq_PI
+      5. 解耦前馈：Vd += -Lq·ω·Iq,  Vq += Ld·ω·Id + Φ·ω
+      6. 逆Park变换：Vd,Vq,θ → Vα,Vβ
+      7. SVPWM 调制：Vα,Vβ → Vu,Vv,Vw → 直接驱动 IGBT
+
+ServoIP 关键寄存器（来自 JL086ServoIpReg.h）：
+
+  寄存器                  地址          说明
+  ──────────────────────────────────────────────────────────
+  ADINV.IdIn / IqIn      0xC000705C/5E  CPU写入Id/Iq参考值
+  ADINV.PhaseHIn         0xC0007060     CPU写入电气角θ
+  INTADP.KdP / KqP       0xC000707C/7E  d/q轴PI比例增益
+  INTADP.KdI / KqI       0xC0007080/82  d/q轴PI积分增益
+  INTADP.Ld / Lq         0xC0007076/78  电机dq轴电感（解耦前馈）
+  INTADP.Mag             0xC000707A     磁通量Φ（反电动势前馈）
+  INTADP.Kf11~Kf34       0xC000709A+    3组硬件陷波滤波器系数
+  ACRV.IdIntgl/IqIntgl   0xC0007004/08  PI积分器状态（CPU只读）
+  VCMPV.VdOut/VqOut      0xC0007026/28  dq轴电压输出
+  VCMPV.VuOut/VvOut/VwOut 0xC000702E+   三相SVPWM电压参考
+
+CPU 在初始化和参数变更时，通过 MicroPrmCalc.c 中的 KpxPcalMicroProgram()
+将计算好的增益写入 ServoIP 寄存器（LpxSetPrmToASIC）：
+
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.KdP), kp, ... );  // d轴比例增益
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.KdI), kx, ... );  // d轴积分增益
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.KqP), kp, ... );  // q轴比例增益
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.KqI), kx, ... );  // q轴积分增益
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.Ld),  kx, ... );  // d轴电感
+  LpxSetPrmToASIC( &(pAsicMicroReg->IntAdP.Lq),  kx, ... );  // q轴电感
+
+注：旧代码注释中出现的"JL-077"是上一代 SGDV 系列的同类芯片型号，
+Sigma-7（SGD7）换成了 JL-086，电流环仍在专用 ASIC 的 ServoIP 模块内，
+并非外部 FPGA。
+
+
+================================================================================
